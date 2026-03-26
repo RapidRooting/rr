@@ -1,3 +1,3 @@
-module github.com/Folium1/RapidRoot
+module github.com/RapidRooting/rr
 
-go 1.21.5
+go 1.26.1
