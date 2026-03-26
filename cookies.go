@@ -5,120 +5,99 @@ import (
 	"time"
 )
 
-type cookies struct {
-	defaults *http.Cookie
+// CookieDefaults holds the default attributes applied to every cookie
+// set via Request.SetCookie. Configure them on the Router before starting:
+//
+//	router := NewRouter()
+//	router.CookieDefaults.Secure = false   // e.g. for local dev
+//	router.CookieDefaults.Path = "/api"
+type CookieDefaults struct {
+	HttpOnly bool
+	Secure   bool
+	SameSite http.SameSite
+	Path     string
+	Domain   string
+	MaxAge   int
 }
 
-// Cookie returns one value from cookies.
-func (r *Request) Cookie(key string) (*http.Cookie, error) {
-	cookie, err := r.Req.Cookie(key)
-	if err != nil {
-		return nil, err
+// defaultCookieDefaults returns secure-by-default cookie settings.
+func defaultCookieDefaults() CookieDefaults {
+	return CookieDefaults{
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+		Path:     "/",
 	}
-	return cookie, nil
 }
 
-// Cookies returns slice of all cookies.
+// Cookie returns a single cookie by name, or an error if not found.
+func (r *Request) Cookie(name string) (*http.Cookie, error) {
+	return r.Req.Cookie(name)
+}
+
+// Cookies returns all cookies from the request.
 func (r *Request) Cookies() []*http.Cookie {
 	return r.Req.Cookies()
 }
 
-// SetCookie put key-value to cookies.
-func (r *Request) SetCookie(key string, val string, exp time.Time) {
+// SetCookie sets a cookie using the router's default attributes.
+func (r *Request) SetCookie(name, value string, expires time.Time) {
+	d := r.cookieDefaults
 	http.SetCookie(r.Writer, &http.Cookie{
-		Name:     key,
-		Value:    val,
-		Expires:  exp,
-		HttpOnly: r.cookie.defaults.HttpOnly,
-		Secure:   r.cookie.defaults.Secure,
-		SameSite: r.cookie.defaults.SameSite,
-		Path:     r.cookie.defaults.Path,
+		Name:     name,
+		Value:    value,
+		Expires:  expires,
+		HttpOnly: d.HttpOnly,
+		Secure:   d.Secure,
+		SameSite: d.SameSite,
+		Path:     d.Path,
+		Domain:   d.Domain,
+		MaxAge:   d.MaxAge,
 	})
 }
 
-// SetCookieObj puts cookie object to cookies.
+// SetCookieObj sets a fully custom cookie, ignoring defaults.
 func (r *Request) SetCookieObj(cookie *http.Cookie) {
 	http.SetCookie(r.Writer, cookie)
 }
 
-// SetCookiesHTTPOnly sets httpOnly to all cookies.
-func (r *Request) SetCookiesHTTPOnly(httpOnly bool) {
-	r.cookie.defaults.HttpOnly = httpOnly
+// RemoveCookie expires a cookie by name.
+func (r *Request) RemoveCookie(name string) {
+	http.SetCookie(r.Writer, &http.Cookie{
+		Name:     name,
+		Value:    "",
+		Expires:  time.Unix(0, 0),
+		MaxAge:   -1,
+		HttpOnly: r.cookieDefaults.HttpOnly,
+		Secure:   r.cookieDefaults.Secure,
+		SameSite: r.cookieDefaults.SameSite,
+		Path:     r.cookieDefaults.Path,
+		Domain:   r.cookieDefaults.Domain,
+	})
 }
 
-// SetCookiesSecure sets secure to all cookies.
-func (r *Request) SetCookiesSecure(secure bool) {
-	r.cookie.defaults.Secure = secure
-}
-
-// SetCookiesSameSite sets sameSite to all cookies.
-func (r *Request) SetCookiesSameSite(same http.SameSite) {
-	r.cookie.defaults.SameSite = same
-}
-
-// RemoveCookie removes cookie by key.
-func (r *Request) RemoveCookie(key string) {
-	r.SetCookie(key, "", time.Unix(0, 0))
-}
-
-// RemoveAllCookies removes all cookies from request.
+// RemoveAllCookies expires every cookie present in the request.
 func (r *Request) RemoveAllCookies() {
-	for _, cookie := range r.Cookies() {
-		r.RemoveCookie(cookie.Name)
+	for _, c := range r.Cookies() {
+		r.RemoveCookie(c.Name)
 	}
 }
 
-// SetCookieWithOptions puts a key-value pair into the cookies with additional options.
-func (r *Request) SetCookieWithOptions(key, val string, exp time.Time) {
-	cookie := &http.Cookie{
-		Name:     key,
-		Value:    val,
-		Expires:  exp,
-		HttpOnly: r.cookie.defaults.HttpOnly,
-		Secure:   r.cookie.defaults.Secure,
-		SameSite: r.cookie.defaults.SameSite,
-		Path:     r.cookie.defaults.Path,
-		Domain:   r.cookie.defaults.Domain,
-		MaxAge:   r.cookie.defaults.MaxAge,
-		Raw:      r.cookie.defaults.Raw,
-		RawExpires: r.cookie.defaults.RawExpires,
-		Unparsed: r.cookie.defaults.Unparsed,
+// RemoveAllCookiesExcept expires all cookies except the named ones.
+func (r *Request) RemoveAllCookiesExcept(keep ...string) {
+	set := make(map[string]struct{}, len(keep))
+	for _, k := range keep {
+		set[k] = struct{}{}
 	}
-
-	http.SetCookie(r.Writer, cookie)
-}
-
-// SetDefaultCookieOptions sets default values for cookie attributes.
-func (r *Request) SetDefaultCookieOptions(options *http.Cookie) {
-	if options == nil {
-		options = &http.Cookie{}
-	}
-	r.cookie.defaults = options
-}
-
-// SetCookiePath sets the path for the cookie.
-func (r *Request) SetCookiePath(path string) {
-	if path == "" {
-		path = "/"
-	}
-	r.cookie.defaults.Path = path
-}
-
-// SetSecureFlagAutomatically sets the Secure flag based on the request's scheme.
-func (r *Request) SetSecureFlagAutomatically() {
-	if r.Req.TLS != nil {
-		r.cookie.defaults.Secure = true
-	} else {
-		r.cookie.defaults.Secure = false
-	}
-}
-
-// RemoveAllCookiesExcept removes all cookies from the response except the specified ones.
-func (r *Request) RemoveAllCookiesExcept(exceptions ...string) {
-	cookies := r.Cookies()
-	for _, cookie := range cookies {
-		if !contains(exceptions, cookie.Name) {
-			r.RemoveCookie(cookie.Name)
+	for _, c := range r.Cookies() {
+		if _, ok := set[c.Name]; !ok {
+			r.RemoveCookie(c.Name)
 		}
 	}
+}
+
+// SetSecureFlagFromRequest sets the Secure default based on whether
+// the current request arrived over TLS.
+func (r *Request) SetSecureFlagFromRequest() {
+	r.cookieDefaults.Secure = r.Req.TLS != nil
 }

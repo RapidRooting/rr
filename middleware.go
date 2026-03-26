@@ -1,128 +1,107 @@
 package rapidroot
 
-import "strings"
+import "net/http"
 
+// HandlerFunc is a function that handles HTTP requests.
+type HandlerFunc func(*Request)
+
+// Middleware wraps a HandlerFunc, returning a new HandlerFunc.
 type Middleware func(HandlerFunc) HandlerFunc
 
-// GroupMiddleware adds middleware to the group of routes that have the same path prefix
-// Example:
+// notFoundHandler writes a 404 response.
+func notFoundHandler(w http.ResponseWriter, r *http.Request) {
+	http.NotFound(w, r)
+}
+
+// GroupMiddleware attaches middleware to all routes sharing the path prefix.
 //
-//	router := NewRouter()
-//	router.GroupMiddleware(http.MethodGet, "/api", middleware1, middleware2)
-//	router.GET("/api/users", usersHandler)
-//	router.GET("/api/users/:id", userHandler)
-//
-//	// The middleware1 and middleware2 will be applied to both usersHandler and userHandler
-func (r *Router) GroupMiddleware(method, path string, middleware ...Middleware) {
-	if len(middleware) == 0 {
+//	router.GroupMiddleware("GET", "/api", authMW)
+//	router.GET("/api/users", listUsers)   // authMW applied
+//	router.GET("/api/orders", listOrders) // authMW applied
+func (r *Router) GroupMiddleware(method, path string, mw ...Middleware) {
+	if len(mw) == 0 {
 		return
 	}
-
 	path = cleanPath(path)
 	root := r.getOrCreateRoot(method)
-
-	if path == "/" {
-		if root.pathSegment != "/" {
-			newRoot := newNode()
-			newRoot.pathSegment = "/"
-			newRoot.children = append(newRoot.children, root)
-			r.tree[method] = newRoot
-		} else {
-			root.groupMiddleware = append(root.groupMiddleware, middleware...)
-		}
-	}
-
-	addMiddlewareOrGroupToTree(path, root, middleware, true)
+	n := walkOrCreate(path, root)
+	n.groupMW = append(n.groupMW, mw...)
 }
 
-// Middleware adds middleware to the route with the specified path
-// Example:
+// Middleware attaches middleware to a single route.
 //
-//	router := NewRouter()
-//	router.Middleware(http.MethodGet, "/api/users", middleware1, middleware2)
-//	router.GET("/api/users", usersHandler)
-//
-// The middleware1 and middleware2 will be applied to usersHandler
-func (r *Router) Middleware(method, path string, middleware ...Middleware) {
+//	router.Middleware("GET", "/admin", adminOnly)
+func (r *Router) Middleware(method, path string, mw ...Middleware) {
+	if len(mw) == 0 {
+		return
+	}
+	path = cleanPath(path)
 	root := r.getOrCreateRoot(method)
-	node := getNode(path, root, nil)
-	if node == nil {
-		addMiddlewareOrGroupToTree(cleanPath(path), root, middleware, false)
-	} else {
-		node.currentNodeMiddleware = append(node.currentNodeMiddleware, middleware...)
+	n := walkOrCreate(path, root)
+	n.nodeMW = append(n.nodeMW, mw...)
+}
+
+// walkOrCreate walks or creates tree nodes for path. Used by middleware registration.
+func walkOrCreate(path string, root *node) *node {
+	cur := root
+	forEachSegment(path, func(seg string) {
+		if isCatchAll(seg) {
+			cur = cur.setCatchAll(trimPrefix(seg))
+		} else if isDynamic(seg) {
+			cur = cur.setWildcard(trimPrefix(seg))
+		} else {
+			cur = cur.addStaticChild(seg)
+		}
+	})
+	return cur
+}
+
+// applyMiddleware bakes all middleware into handlers at startup.
+// Called once before the server starts listening.
+func (r *Router) applyMiddleware() {
+	for _, root := range r.trees {
+		r.traverse(root, nil)
 	}
 }
 
-func addMiddlewareOrGroupToTree(path string, root *node, middleware []Middleware, isGroup bool) {
-	segments := strings.Split(path, "/")
-	currentNode := root
-
-	for i, segment := range segments {
-		childNode := currentNode.child(segment)
-
-		if childNode == nil {
-			childNode = newNode()
-			childNode.pathSegment = segment
-			currentNode.addChild(childNode)
-		}
-
-		currentNode = childNode
-
-		if isDynamicSegment(segment) {
-			currentNode.isDynamic = true
-			currentNode.pathSegment = segment[1:]
-		}
-
-		if i == len(segments)-1 {
-			if isGroup {
-				currentNode.groupMiddleware = append(currentNode.groupMiddleware, middleware...)
-			} else {
-				currentNode.currentNodeMiddleware = append(currentNode.currentNodeMiddleware, middleware...)
-			}
-		}
-	}
-}
-
-func (r *Router) applyMiddlewareForRoutes() {
-	// Apply middlewares for the root node
-	for _, node := range r.tree {
-		if node.handler != nil {
-			r.applyMiddlewares(node)
-		}
-		r.traverseAndApplyMiddleware(node, node.groupMiddleware...)
-	}
-
-	// Free memory for the root nodes
-	for _, node := range r.tree {
-		node.freeMiddlewaresMemory()
-	}
-}
-
-func (r *Router) applyMiddlewares(currentNode *node) {
-	for i := len(currentNode.currentNodeMiddleware) - 1; i >= 0; i-- {
-		currentNode.handler = currentNode.currentNodeMiddleware[i](currentNode.handler)
-	}
-
-	for _, parentMiddleware := range currentNode.groupMiddleware {
-		currentNode.handler = parentMiddleware(currentNode.handler)
-	}
-}
-
-func (r *Router) traverseAndApplyMiddleware(node *node, parentMiddlewares ...Middleware) {
-	if node == nil {
+// traverse recursively applies middleware to all nodes in the tree.
+// parentMW is defensively copied to prevent slice mutation across siblings.
+func (r *Router) traverse(n *node, parentMW []Middleware) {
+	if n == nil {
 		return
 	}
 
-	allMiddlewares := append(parentMiddlewares, node.groupMiddleware...)
-	allMiddlewares = append(allMiddlewares, node.currentNodeMiddleware...)
+	// Build inherited chain: parent group + this node's group middleware.
+	// CRITICAL: allocate a new slice so append never mutates the caller's backing array.
+	inherited := make([]Middleware, 0, len(parentMW)+len(n.groupMW))
+	inherited = append(inherited, parentMW...)
+	inherited = append(inherited, n.groupMW...)
 
-	for _, child := range node.children {
-		r.traverseAndApplyMiddleware(child, allMiddlewares...)
+	// Full chain for this node: inherited + node-specific middleware.
+	if n.handler != nil {
+		full := make([]Middleware, 0, len(inherited)+len(n.nodeMW))
+		full = append(full, inherited...)
+		full = append(full, n.nodeMW...)
+
+		h := n.handler
+		for i := len(full) - 1; i >= 0; i-- {
+			h = full[i](h)
+		}
+		n.handler = h
 	}
 
-	for i := len(allMiddlewares) - 1; i >= 0; i-- {
-		node.handler = allMiddlewares[i](node.handler)
-	}
+	// Free — middleware is baked into the handler now.
+	n.groupMW = nil
+	n.nodeMW = nil
 
-	node.freeMiddlewaresMemory()
+	// Recurse with a copy of inherited for each subtree.
+	for _, ch := range n.children {
+		r.traverse(ch, inherited)
+	}
+	if n.wildcard != nil {
+		r.traverse(n.wildcard, inherited)
+	}
+	if n.catchAll != nil {
+		r.traverse(n.catchAll, inherited)
+	}
 }

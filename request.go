@@ -1,6 +1,9 @@
 package rapidroot
 
 import (
+	"context"
+	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -8,234 +11,183 @@ import (
 	"sync"
 )
 
-// Request is a struct for handlers, to interact with request.
+// Request wraps http.Request and http.ResponseWriter with convenience methods.
 type Request struct {
 	Writer http.ResponseWriter
 	Req    *http.Request
 
-	// used to prevent usage of the shared memory of the data by multiple goroutines
-	mu *sync.Mutex
-
-	// used to save data in Request, and then it can be used in other handlers or middlewares
-	data map[string]any
-
-	// data from r.Req.URL.Query().
-	queryValues url.Values
-
-	// used for log, to print the name of the function
-	handlerName string
-
-	// used to interact with cookies
-	cookie *cookies
-
-	// used to abort request
-	isAborted bool
+	pathParams     map[string]string
+	queryValues    url.Values
+	cookieDefaults *CookieDefaults
+	aborted        bool
+	wroteHeader    bool
 }
 
-var requestPool sync.Pool
+var requestPool = sync.Pool{
+	New: func() any {
+		return &Request{
+			pathParams: make(map[string]string, 4),
+		}
+	},
+}
 
-func init() {
-	requestPool = sync.Pool{
-		New: func() interface{} {
-			return &Request{}
-		},
+// acquireRequest gets a Request from the pool and initialises it.
+func acquireRequest(w http.ResponseWriter, r *http.Request, cd *CookieDefaults) *Request {
+	req := requestPool.Get().(*Request)
+	req.Writer = w
+	req.Req = r
+	req.queryValues = r.URL.Query()
+	req.cookieDefaults = cd
+	req.aborted = false
+	req.wroteHeader = false
+	return req
+}
+
+// releaseRequest clears and returns a Request to the pool.
+func releaseRequest(req *Request) {
+	req.Writer = nil
+	req.Req = nil
+	req.queryValues = nil
+	req.cookieDefaults = nil
+	req.aborted = false
+	req.wroteHeader = false
+	for k := range req.pathParams {
+		delete(req.pathParams, k)
 	}
+	requestPool.Put(req)
 }
 
-// GetRequest retrieves a Request from the sync pool.
-func getRequest(w http.ResponseWriter, req *http.Request) *Request {
-	request := requestPool.Get().(*Request)
-	request.Writer = w
-	request.Req = req
-	request.data = make(map[string]any)
-	request.queryValues = req.URL.Query()
-
-	return request
+// setParam implements paramSetter for tree lookups.
+func (r *Request) setParam(key, value string) {
+	r.pathParams[key] = value
 }
 
-func (r *Request) reset() {
-	r.Writer = nil
-	r.Req = nil
-	r.data = nil
-	r.queryValues = nil
-	r.cookie = nil
-	r.handlerName = ""
-	r.isAborted = false
+// ---------- Context ---------------------------------------------------------
+
+// Context returns the request context.
+func (r *Request) Context() context.Context {
+	return r.Req.Context()
 }
 
-// ReleaseRequest releases a Request back to the sync pool.
-func releaseRequest(request *Request) {
-	request.reset()
-	requestPool.Put(request)
+// WithContext replaces the underlying request's context.
+func (r *Request) WithContext(ctx context.Context) {
+	r.Req = r.Req.WithContext(ctx)
 }
-func newRequest(writer http.ResponseWriter, req *http.Request) *Request {
-	// Initialize a new Request struct
-	newRequest := &Request{
-		Writer:      writer,
-		Req:         req,
-		mu:          new(sync.Mutex),
-		data:        make(map[string]interface{}),
-		queryValues: req.URL.Query(),
-		cookie: &cookies{
-			defaults: &http.Cookie{
-				HttpOnly: true,
-				Secure:   true,
-				SameSite: http.SameSiteStrictMode,
-				Path:     "/",
-			},
-		},
-		handlerName: "",
-		isAborted:   false,
+
+// ---------- Path Parameters -------------------------------------------------
+
+// Param returns the value of a named path parameter (e.g. :id → "42").
+func (r *Request) Param(key string) string {
+	return r.pathParams[key]
+}
+
+// Params returns a copy of all path parameters.
+func (r *Request) Params() map[string]string {
+	cp := make(map[string]string, len(r.pathParams))
+	for k, v := range r.pathParams {
+		cp[k] = v
 	}
-
-	return newRequest
+	return cp
 }
 
-/*
-//////////////////////////////////
-!!!!!Request manipulations!!!!!!!!
-//////////////////////////////////
-*/
+// ---------- Query -----------------------------------------------------------
 
-// SetValue puts key-value to the Request.
-func (r *Request) SetValue(key string, val any) {
-	r.data[key] = val
-}
-
-// Value returns value set to the Request struct.
-func (r *Request) Value(key string) any {
-	return r.data[key]
-}
-
-// Values returns all values set to Request struct.
-func (r *Request) Values() map[string]any {
-	return r.data
-}
-
-// SetStatus should be used,if you don't use response functions of this package.
-func (r *Request) SetStatus(code int) {
-	r.Writer.WriteHeader(code)
-}
-
-func (r *Request) GetStatus() int {
-	return r.Writer.(*responseCodeWrapper).statusCode
-}
-
-// QueryValue returns value from query.
-func (r *Request) QueryValue(key string) string {
+// Query returns a single query parameter value.
+func (r *Request) Query(key string) string {
 	return r.queryValues.Get(key)
 }
 
-// QueryValues returns all values from query.
+// QueryValues returns all query parameters.
 func (r *Request) QueryValues() url.Values {
 	return r.queryValues
 }
 
-// PostFormValues returns all values from post form.
-func (r *Request) PostFormValues() url.Values {
-	return r.Req.PostForm
-}
+// ---------- Form ------------------------------------------------------------
 
-// PostFormVal returns value from post form.
-func (r *Request) PostFormVal(key string) string {
+// FormValue returns a single form value.
+func (r *Request) FormValue(key string) string {
 	return r.Req.FormValue(key)
 }
 
-// IsAborted returns true if request is aborted.
-func (r *Request) IsAborted() bool {
-	return r.isAborted
-}
+// ---------- Abort -----------------------------------------------------------
 
-// Abort aborts request.
+// Abort marks the request as aborted. Middleware should check IsAborted.
 func (r *Request) Abort() {
-	r.isAborted = true
+	r.aborted = true
 }
 
-/*
-//////////////////////////
-!!!!!!!!!RESPONSE!!!!!!!!!
-//////////////////////////
-*/
+// IsAborted reports whether the request was aborted.
+func (r *Request) IsAborted() bool {
+	return r.aborted
+}
 
-// Redirect redirects request to another url.
-// Only codes from 300 to 308 are valid.
+// ---------- Response Writers ------------------------------------------------
+
+// writeHeader writes status code once, preventing double writes.
+func (r *Request) writeHeader(code int) {
+	if !r.wroteHeader {
+		r.Writer.WriteHeader(code)
+		r.wroteHeader = true
+	}
+}
+
+// JSON encodes data as JSON and writes it with the given status code.
+func (r *Request) JSON(code int, data any) {
+	r.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	r.writeHeader(code)
+	if err := json.NewEncoder(r.Writer).Encode(data); err != nil {
+		fmt.Fprintf(r.Writer, `{"error":%q}`, err.Error())
+	}
+}
+
+// XML encodes data as XML and writes it with the given status code.
+func (r *Request) XML(code int, data any) {
+	r.Writer.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	r.writeHeader(code)
+	if err := xml.NewEncoder(r.Writer).Encode(data); err != nil {
+		fmt.Fprintf(r.Writer, "<error>%s</error>", err.Error())
+	}
+}
+
+// HTML parses the named template file and executes it with data.
+func (r *Request) HTML(code int, filename string, data any) {
+	tmpl, err := template.ParseFiles(filename)
+	if err != nil {
+		http.Error(r.Writer, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	r.Writer.Header().Set("Content-Type", "text/html; charset=utf-8")
+	r.writeHeader(code)
+	if execErr := tmpl.Execute(r.Writer, data); execErr != nil {
+		fmt.Fprintf(r.Writer, "template error: %v", execErr)
+	}
+}
+
+// Text writes a plain text response.
+func (r *Request) Text(code int, text string) {
+	r.Writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	r.writeHeader(code)
+	fmt.Fprint(r.Writer, text)
+}
+
+// Bytes writes raw bytes with the given status code.
+func (r *Request) Bytes(code int, contentType string, data []byte) {
+	r.Writer.Header().Set("Content-Type", contentType)
+	r.writeHeader(code)
+	_, _ = r.Writer.Write(data)
+}
+
+// Redirect sends an HTTP redirect.
 func (r *Request) Redirect(code int, url string) {
 	http.Redirect(r.Writer, r.Req, url, code)
-	return
 }
 
-// ERROR return an error with status code.
-func (r *Request) ERROR(code int, err error) {
-	http.Error(r.Writer, err.Error(), code)
+// Error writes an HTTP error response.
+func (r *Request) Error(code int, msg string) {
+	http.Error(r.Writer, msg, code)
 }
 
-// JSON parses data to json format and sends response with a provided code.
-func (r *Request) JSON(code int, data any) {
-	r.writeJSON(code, data)
-}
-
-// XML parses data to xml format and sends response with a provided code.
-func (r *Request) XML(code int, data any) {
-	r.writeXML(code, data)
-}
-
-// XMLIndent parses data to xml format and sends response with a provided code.
-func (r *Request) XMLIndent(code int, data any, prefix, indent string) {
-	r.writeXMLIndent(code, data, prefix, indent)
-}
-
-// HTML parses data to HTML format and sends a response with the provided code.
-// If there is no file with such name, it will abort with a 500 error status code.
-func (r *Request) HTML(code int, name string, data any) {
-	if !fileExists(name) {
-		r.abortWithErr(http.StatusInternalServerError, fmt.Errorf(internalServerErr))
-		log.error(fmt.Sprintf("File: %s doesn't exist", name), r.handlerName)
-		return
-	}
-
-	tmpl, err := template.ParseFiles(name)
-	if err != nil {
-		log.error(fmt.Sprintf("Failed to parse HTML file: %s, err: %s", name, err.Error()), r.handlerName)
-		r.abortWithErr(http.StatusInternalServerError, fmt.Errorf(internalServerErr))
-		return
-	}
-
-	r.writeHTML(code, *tmpl, data)
-}
-
-// HTMLTemplate same as HTML, but you can put your html template to execute.
-// You need to set template name to template.Template struct. And then pass it to this function.
-//
-// Example:
-//
-//	  tmpl, err := template.ParseFiles("main.html", "footer.html")
-//		if err != nil {
-//			// handle err
-//		}
-//
-//	  r.HTMLTemplate(200,"main.html", tmpl, data)
-//
-// If there is no file with such name, will abort with 500 error status code.
-func (r *Request) HTMLTemplate(code int, templateName string, tmpl *template.Template, data any) {
-	if templateName == "" {
-		log.error("templateName is empty", r.handlerName)
-		r.abortWithErr(http.StatusInternalServerError, fmt.Errorf(internalServerErr))
-		return
-	}
-	r.writeHTMLTemplate(code, templateName, *tmpl, data)
-}
-
-// BINARY response with binary data and provided code.
-func (r *Request) BINARY(code int, data []byte) {
-	r.writeBINARY(code, data)
-}
-
-// FILE response with file and provided code.
-func (r *Request) FILE(code int, fileName string) {
-	if !fileExists(fileName) {
-		log.error(fmt.Sprintf("File: %s doesn't exist", fileName), r.handlerName)
-		r.abortWithErr(http.StatusInternalServerError, fmt.Errorf(internalServerErr))
-		return
-	}
-	r.writeFILE(code, fileName)
+// Status writes only the status code (for responses with no body).
+func (r *Request) Status(code int) {
+	r.writeHeader(code)
 }
